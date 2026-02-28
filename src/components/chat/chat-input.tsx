@@ -182,7 +182,7 @@ export function ChatInput({
 
   return (
     <div
-      className={`border-t bg-background p-4 transition-colors ${isDragging ? "bg-primary/5 border-primary" : ""}`}
+      className={`border-t bg-background p-4 pwa-safe-bottom transition-colors ${isDragging ? "bg-primary/5 border-primary" : ""}`}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -282,7 +282,7 @@ export function ChatInput({
             )}
           </div>
         </div>
-        <p className="mt-2 text-center text-xs text-muted-foreground">
+        <p className="mt-2 text-center text-xs text-muted-foreground hidden sm:block">
           AI agent with code execution, memory, and web search capabilities
         </p>
       </div>

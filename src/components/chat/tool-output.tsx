@@ -101,6 +101,25 @@ function MediaImage({ filePath }: { filePath: string }) {
   const src = `/api/media/serve?path=${encodeURIComponent(filePath)}`;
   const fileName = filePath.split("/").pop() || "image";
 
+  const handleDownload = (e: React.MouseEvent) => {
+    e.preventDefault();
+    fetch(src)
+      .then((res) => res.blob())
+      .then((blob) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      })
+      .catch(() => {
+        window.open(src, "_blank");
+      });
+  };
+
   return (
     <div className="my-2">
       <a href={src} target="_blank" rel="noopener noreferrer">
@@ -115,14 +134,13 @@ function MediaImage({ filePath }: { filePath: string }) {
       <div className="flex items-center gap-2 mt-1.5 text-xs text-muted-foreground">
         <ImageIcon className="size-3" />
         <span className="truncate">{fileName}</span>
-        <a
-          href={src}
-          download={fileName}
+        <button
+          onClick={handleDownload}
           className="ml-auto flex items-center gap-1 hover:text-foreground transition-colors"
         >
           <Download className="size-3" />
           <span>Download</span>
-        </a>
+        </button>
       </div>
     </div>
   );

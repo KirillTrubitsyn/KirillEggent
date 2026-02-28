@@ -9,7 +9,7 @@ export function SiteHeader({ title }: { title?: string }) {
   const { toggleSidebar } = useSidebar()
 
   return (
-    <header className="bg-background sticky top-0 z-50 flex w-full items-center border-b">
+    <header className="bg-background sticky top-0 z-50 flex w-full flex-col items-stretch border-b pwa-safe-top">
       <div className="flex h-(--header-height) w-full items-center gap-2 px-4">
         <Button
           className="h-8 w-8"

@@ -14,11 +14,354 @@ import { getChat, saveChat } from "@/lib/storage/chat-store";
 import { createAgentTools } from "@/lib/tools/tool";
 import { getProjectMcpTools } from "@/lib/mcp/client";
 import type { AgentContext } from "@/lib/agent/types";
-import type { Attachment, ChatMessage } from "@/lib/types";
+import type { Attachment, ChatMessage, Chat, AppSettings } from "@/lib/types";
 import { publishUiSyncEvent } from "@/lib/realtime/event-bus";
 import fs from "fs/promises";
 
 const LLM_LOG_BORDER = "═".repeat(60);
+
+/**
+ * Maximum number of recent messages to keep in history when calling the LLM.
+ * This prevents the prompt from growing unboundedly as the conversation continues.
+ * Tool-call / tool-result pairs are counted individually.
+ */
+const MAX_HISTORY_MESSAGES = 40;
+
+/**
+ * Trim history to the most recent messages while keeping tool-call/tool-result
+ * pairs intact (never orphan a tool result without its preceding call).
+ */
+function trimHistory(messages: ModelMessage[]): ModelMessage[] {
+  if (messages.length <= MAX_HISTORY_MESSAGES) {
+    return messages;
+  }
+
+  // Take the tail of the history
+  let startIndex = messages.length - MAX_HISTORY_MESSAGES;
+
+  // Ensure we don't start on a tool-result message (orphaned from its call).
+  // Walk forward until we find a user or assistant message.
+  while (startIndex < messages.length && messages[startIndex].role === "tool") {
+    startIndex++;
+  }
+
+  const trimmed = messages.slice(startIndex);
+  if (trimmed.length < messages.length) {
+    console.log(
+      `[Agent] Trimmed history from ${messages.length} to ${trimmed.length} messages`
+    );
+  }
+  return trimmed;
+}
+
+// ---------------------------------------------------------------------------
+// Context optimisation: tool-result truncation + history summarisation
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum character length for tool results in older messages.
+ * Recent messages (last TOOL_RESULT_RECENT_COUNT) keep full results.
+ */
+const MAX_OLD_TOOL_RESULT_CHARS = 500;
+
+/**
+ * Number of most-recent messages whose tool results are kept intact.
+ */
+const TOOL_RESULT_RECENT_COUNT = 10;
+
+/**
+ * Number of most-recent messages kept verbatim when summarisation is used.
+ */
+const RECENT_MESSAGES_WINDOW = 20;
+
+/**
+ * Truncate tool-result outputs (and large tool-call inputs) in older messages
+ * so they don't bloat the context window.
+ */
+function truncateOldToolResults(messages: ModelMessage[]): ModelMessage[] {
+  const recentStart = Math.max(0, messages.length - TOOL_RESULT_RECENT_COUNT);
+
+  return messages.map((msg, index) => {
+    if (index >= recentStart) return msg;
+
+    // --- Truncate tool result outputs ---
+    if (msg.role === "tool" && Array.isArray(msg.content)) {
+      const newContent = (msg.content as Array<Record<string, unknown>>).map(
+        (part) => {
+          if (part.type !== "tool-result") return part;
+
+          const output = part.output;
+          let outputStr: string;
+          if (
+            output &&
+            typeof output === "object" &&
+            "value" in (output as Record<string, unknown>)
+          ) {
+            const val = (output as Record<string, unknown>).value;
+            outputStr = typeof val === "string" ? val : JSON.stringify(val);
+          } else {
+            outputStr =
+              typeof output === "string" ? output : JSON.stringify(output);
+          }
+
+          if (outputStr.length <= MAX_OLD_TOOL_RESULT_CHARS) return part;
+
+          const toolName = (part.toolName as string) || "tool";
+          return {
+            ...part,
+            output: {
+              type: "json",
+              value: `[${toolName}: ${outputStr.length} chars → ${MAX_OLD_TOOL_RESULT_CHARS}]\n${outputStr.slice(0, MAX_OLD_TOOL_RESULT_CHARS)}…`,
+            },
+          };
+        },
+      );
+      return { ...msg, content: newContent } as ModelMessage;
+    }
+
+    // --- Truncate large tool-call inputs in assistant messages ---
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      const newContent = (msg.content as Array<Record<string, unknown>>).map(
+        (part) => {
+          if (part.type !== "tool-call") return part;
+
+          const inputStr = JSON.stringify(part.input);
+          if (inputStr.length <= MAX_OLD_TOOL_RESULT_CHARS) return part;
+
+          const toolName = (part.toolName as string) || "tool";
+          return {
+            ...part,
+            input: {
+              _truncated: true,
+              _summary: `[${toolName} input: ${inputStr.length} chars truncated]`,
+            },
+          };
+        },
+      );
+      return { ...msg, content: newContent } as ModelMessage;
+    }
+
+    return msg;
+  });
+}
+
+/**
+ * Convert a ModelMessage to a compact text line for the summariser prompt.
+ * Tool-result messages are skipped (too verbose, low summary value).
+ */
+function modelMessageToSummaryLine(msg: ModelMessage): string | null {
+  if (msg.role === "user") {
+    const content =
+      typeof msg.content === "string"
+        ? msg.content
+        : JSON.stringify(msg.content);
+    return `User: ${content.slice(0, 300)}`;
+  }
+
+  if (msg.role === "assistant") {
+    if (typeof msg.content === "string") {
+      return msg.content ? `Assistant: ${msg.content.slice(0, 300)}` : null;
+    }
+    if (Array.isArray(msg.content)) {
+      const parts: string[] = [];
+      for (const part of msg.content) {
+        const p = part as Record<string, unknown>;
+        if (p.type === "text" && typeof p.text === "string") {
+          const t = (p.text as string).trim();
+          if (t) parts.push(t.slice(0, 200));
+        } else if (p.type === "tool-call" && typeof p.toolName === "string") {
+          parts.push(`[called ${p.toolName}]`);
+        }
+      }
+      return parts.length ? `Assistant: ${parts.join(" ")}` : null;
+    }
+    return null;
+  }
+
+  return null; // skip tool results
+}
+
+/**
+ * Generate a concise summary of older messages using the utility model.
+ */
+async function generateHistorySummary(
+  messages: ModelMessage[],
+  settings: AppSettings,
+): Promise<string> {
+  const model = createModel(settings.utilityModel);
+
+  const lines: string[] = [];
+  for (const msg of messages) {
+    const line = modelMessageToSummaryLine(msg);
+    if (line) lines.push(line);
+  }
+
+  let conversationText = lines.join("\n");
+  // Cap input to the summariser to avoid excessive cost
+  if (conversationText.length > 12000) {
+    conversationText =
+      conversationText.slice(0, 12000) + "\n…[rest truncated]";
+  }
+
+  const result = await generateText({
+    model,
+    messages: [
+      {
+        role: "user",
+        content:
+          `Summarize this conversation between a user and an AI assistant.\n` +
+          `Preserve: key topics discussed, decisions made, important facts, ` +
+          `current task context, and any unresolved questions.\n` +
+          `Be concise (max 400 words). Write in the same language as the conversation.\n\n` +
+          conversationText,
+      },
+    ],
+    temperature: 0.3,
+    maxOutputTokens: 1024,
+  });
+
+  return result.text;
+}
+
+/**
+ * Prepare an optimised message history for the LLM:
+ *  1. Truncate tool results in older messages
+ *  2. When history exceeds MAX_HISTORY_MESSAGES, summarise older messages
+ *     via the utility model and keep only recent ones verbatim
+ *
+ * The summary is cached on the Chat object to avoid re-generation.
+ */
+async function prepareOptimizedHistory(
+  allMessages: ModelMessage[],
+  chat: Chat | null,
+  settings: AppSettings,
+): Promise<ModelMessage[]> {
+  // Step 1: Always truncate old tool results
+  const processed = truncateOldToolResults(allMessages);
+
+  // Step 2: If within budget, return as-is
+  if (processed.length <= MAX_HISTORY_MESSAGES) {
+    return processed;
+  }
+
+  // Step 3: Split into old (to summarise) and recent (to keep verbatim)
+  let recentStart = Math.max(0, processed.length - RECENT_MESSAGES_WINDOW);
+  // Never orphan a tool result without its preceding call
+  while (
+    recentStart < processed.length &&
+    processed[recentStart].role === "tool"
+  ) {
+    recentStart++;
+  }
+
+  const oldMessages = processed.slice(0, recentStart);
+  const recentMessages = processed.slice(recentStart);
+
+  if (oldMessages.length === 0) {
+    return recentMessages;
+  }
+
+  // Step 4: Check whether a cached summary is still fresh enough
+  const cacheValid =
+    chat?.historySummary &&
+    typeof chat.historySummaryUpToIndex === "number" &&
+    Math.abs(chat.historySummaryUpToIndex - oldMessages.length) <= 5;
+
+  let summary: string;
+
+  if (cacheValid) {
+    summary = chat!.historySummary!;
+    console.log(
+      `[Agent] Using cached history summary (covers ${chat!.historySummaryUpToIndex} messages)`,
+    );
+  } else {
+    console.log(
+      `[Agent] Generating history summary for ${oldMessages.length} old messages…`,
+    );
+    try {
+      summary = await generateHistorySummary(oldMessages, settings);
+      // Cache the summary on the chat object
+      if (chat) {
+        chat.historySummary = summary;
+        chat.historySummaryUpToIndex = oldMessages.length;
+        await saveChat(chat);
+      }
+      console.log(`[Agent] Summary generated (${summary.length} chars)`);
+    } catch (err) {
+      console.error(
+        "[Agent] Summary generation failed, falling back to trimHistory:",
+        err,
+      );
+      return trimHistory(processed);
+    }
+  }
+
+  // Step 5: Build optimised history — summary pair + recent messages
+  const optimized: ModelMessage[] = [
+    {
+      role: "user",
+      content: `[Summary of earlier conversation (${oldMessages.length} messages)]:\n${summary}`,
+    },
+    {
+      role: "assistant",
+      content:
+        "I have the context from our previous conversation. Let's continue.",
+    },
+    ...recentMessages,
+  ];
+
+  console.log(
+    `[Agent] Optimized history: ${allMessages.length} → ${optimized.length} messages ` +
+      `(summary + ${recentMessages.length} recent)`,
+  );
+
+  return optimized;
+}
+
+/**
+ * After generateText completes, extract the final text.  When `generated.text`
+ * is empty (e.g. generation stopped on a tool-call step) we scan all response
+ * messages for the last non-empty assistant text so the user still gets an
+ * answer rather than "Пустой ответ от агента".
+ */
+function extractFinalText(
+  generated: { text: string; response?: { messages?: ModelMessage[] } }
+): string {
+  const primary = (generated.text ?? "").trim();
+  if (primary) return primary;
+
+  const responseMessages = generated.response?.messages;
+  if (!Array.isArray(responseMessages) || responseMessages.length === 0) {
+    return "";
+  }
+
+  // Walk response messages backwards looking for any assistant text
+  for (let i = responseMessages.length - 1; i >= 0; i--) {
+    const msg = responseMessages[i];
+    if (msg.role !== "assistant") continue;
+
+    const content = msg.content;
+    if (typeof content === "string" && content.trim()) {
+      return content.trim();
+    }
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (
+          typeof part === "object" &&
+          part !== null &&
+          "type" in part &&
+          part.type === "text" &&
+          "text" in part
+        ) {
+          const text = (part as { text: string }).text.trim();
+          if (text) return text;
+        }
+      }
+    }
+  }
+
+  return "";
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (value == null || typeof value !== "object" || Array.isArray(value)) {
@@ -293,6 +636,51 @@ function hasImages(attachments?: Attachment[]): boolean {
 }
 
 /**
+ * Detect whether a user message is a complex / coding task that should be
+ * routed to the utility (heavy) model instead of the lightweight chat model.
+ *
+ * Heuristics:
+ *  1. Contains fenced code blocks (```).
+ *  2. Contains programming-related action verbs (write, implement, fix, debug …).
+ *  3. Contains technical keywords (function, class, API, database …).
+ *  4. The message is long (> 300 chars), which usually signals a complex request.
+ */
+function isComplexTask(text: string): boolean {
+  // 1. Fenced code blocks
+  if (/```/.test(text)) return true;
+
+  const lower = text.toLowerCase();
+
+  // 2. Programming action verbs (with word boundaries for accuracy)
+  const actionPatterns = [
+    /\b(?:напиши|написать|реализуй|реализовать|исправь|исправить|отладь|отладить|рефакторь|рефакторинг|оптимизируй|оптимизировать|создай|создать|добавь|добавить|удали|удалить|измени|изменить|обнови|обновить|разработай|разработать|сгенерируй|сгенерировать|проанализируй|проанализировать)\b/,
+    /\b(?:write|implement|code|fix|debug|refactor|optimize|deploy|build|compile|develop|generate|create|add|remove|delete|update|modify|migrate|test|analyze|architect|design)\s/,
+    /\b(?:make a|build a|create a|write a|implement a|add a|fix the|debug the|refactor the)\b/,
+  ];
+  if (actionPatterns.some((p) => p.test(lower))) {
+    // Only trigger if there is also a technical hint — avoid false positives
+    // on innocent phrases like "write a poem" or "create a story".
+    const techHints =
+      /\b(?:код|кода|коде|функци|метод|класс|компонент|модуль|эндпоинт|баг|ошибк|сервер|скрипт|тест|бэкенд|фронтенд|api|sql|html|css|js|ts|json|yaml|docker|git|npm|pip|bash|shell|regex|http|rest|graphql|grpc|websocket|function|class|component|module|endpoint|bug|error|server|script|test|backend|frontend|database|query|schema|migration|pipeline|ci\/cd|kubernetes|terraform|aws|gcp|azure)\b/;
+    if (techHints.test(lower)) return true;
+  }
+
+  // 3. Heavy technical content even without action verbs
+  const codeIndicators = [
+    /\b(?:import|export|const|let|var|function|class|interface|type|enum|async|await|return|throw|try|catch)\b/,
+    /[{}\[\]();]=>/,             // common code punctuation
+    /\b(?:npm|yarn|pip|cargo|go get|apt|brew)\s+(?:install|add|run|build)\b/,
+    /\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE TABLE|ALTER TABLE|DROP)\b/,
+  ];
+  if (codeIndicators.some((p) => p.test(text))) return true;
+
+  // 4. Long messages are usually complex requests
+  if (text.length > 300) return true;
+
+  return false;
+}
+
+/**
  * Build a multimodal user message content array from text + image attachments.
  * Falls back to a plain string when there are no image attachments.
  */
@@ -367,7 +755,9 @@ export async function runAgent(options: {
   const settings = await getSettings();
   const modelConfig = hasImages(options.attachments)
     ? settings.multimediaModel
-    : settings.chatModel;
+    : isComplexTask(options.userMessage)
+      ? settings.utilityModel
+      : settings.chatModel;
   const model = createModel(modelConfig);
 
   // Build context
@@ -419,8 +809,13 @@ export async function runAgent(options: {
 
   // Append user message to history (multimodal if image attachments present)
   const userContent = await buildUserContent(options.userMessage, options.attachments);
+  const optimizedHistory = await prepareOptimizedHistory(
+    context.history,
+    chat,
+    settings,
+  );
   const messages: ModelMessage[] = [
-    ...context.history,
+    ...optimizedHistory,
     { role: "user", content: userContent },
   ];
 
@@ -529,7 +924,9 @@ export async function runAgentText(options: {
   const settings = await getSettings();
   const modelConfig = hasImages(options.attachments)
     ? settings.multimediaModel
-    : settings.chatModel;
+    : isComplexTask(options.userMessage)
+      ? settings.utilityModel
+      : settings.chatModel;
   const model = createModel(modelConfig);
 
   const context: AgentContext = {
@@ -572,8 +969,13 @@ export async function runAgentText(options: {
   });
 
   const userContent = await buildUserContent(options.userMessage, options.attachments);
+  const optimizedHistory = await prepareOptimizedHistory(
+    context.history,
+    chat,
+    settings,
+  );
   const messages: ModelMessage[] = [
-    ...context.history,
+    ...optimizedHistory,
     { role: "user", content: userContent },
   ];
 
@@ -598,7 +1000,9 @@ export async function runAgentText(options: {
       maxOutputTokens: modelConfig.maxTokens ?? 4096,
     });
 
-    const text = generated.text ?? "";
+    const text = extractFinalText(
+      generated as unknown as { text: string; response?: { messages?: ModelMessage[] } }
+    );
 
     try {
       const latest = await getChat(options.chatId);
@@ -711,7 +1115,7 @@ export async function runSubordinateAgent(options: {
   });
 
   // Include relevant parent history for context
-  const relevantHistory = options.parentHistory.slice(-6);
+  const relevantHistory = trimHistory(options.parentHistory).slice(-6);
 
   const messages: ModelMessage[] = [
     ...relevantHistory,
