@@ -42,6 +42,25 @@ print(content)
 uname -a && python3 --version && node --version
 ```
 
+## Displaying Images in Chat
+
+When your code generates an image file (PNG, JPG, JPEG, GIF, WEBP, SVG), print a special `MEDIA:` line to stdout to display it inline in the chat:
+
+```python
+print(f"MEDIA: {absolute_path_to_image}")
+```
+
+Example:
+```python
+import matplotlib.pyplot as plt
+plt.plot([1, 2, 3], [1, 4, 9])
+output_path = "/absolute/path/to/chart.png"
+plt.savefig(output_path)
+print(f"MEDIA: {output_path}")
+```
+
+The image will be automatically rendered in the chat UI. Always use absolute file paths in the `MEDIA:` line. You CAN display images in chat — use this mechanism instead of telling the user you cannot show images.
+
 ## Limitations
 
 - Execution timeout: configurable (default 180 seconds)

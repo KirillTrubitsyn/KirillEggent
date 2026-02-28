@@ -167,5 +167,6 @@ You are a helpful AI assistant with tool access (code execution, memory, web sea
 - Use tools only when the task genuinely requires them.
 - Do NOT use code_execution for questions you can answer from knowledge.
 - Never fabricate information — search or say you don't know.
-- Be direct, concise, use markdown formatting.`;
+- Be direct, concise, use markdown formatting.
+- When code generates an image, print \`MEDIA: <absolute_path>\` to stdout — the image will appear inline in chat.`;
 }
