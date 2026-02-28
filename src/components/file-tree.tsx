@@ -127,6 +127,13 @@ function TreeNode({
         void loadChildren(true, true);
       }
       setCurrentPath(relativePath);
+    } else if (type === "file" && downloadHref) {
+      const a = document.createElement("a");
+      a.href = downloadHref;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
     }
   };
 
@@ -140,7 +147,7 @@ function TreeNode({
         onClick={handleClick}
         className={cn(
           "flex items-center gap-1 w-full text-left text-xs py-1 px-1 rounded-sm hover:bg-accent/50 transition-colors",
-          type === "file" && "pr-7",
+          type === "file" && "pr-7 cursor-pointer",
           isActive && "bg-accent text-accent-foreground font-medium"
         )}
         style={{ paddingLeft: `${depth * 12 + 4}px` }}
