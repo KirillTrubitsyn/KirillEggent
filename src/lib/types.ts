@@ -87,6 +87,10 @@ export interface Chat {
   /** Owner user ID — set on creation for per-user data isolation. */
   userId?: string;
   messages: ChatMessage[];
+  /** Cached summary of older conversation history for context compression */
+  historySummary?: string;
+  /** Number of messages covered by the cached historySummary */
+  historySummaryUpToIndex?: number;
   createdAt: string;
   updatedAt: string;
 }
