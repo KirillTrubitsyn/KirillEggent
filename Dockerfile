@@ -48,6 +48,7 @@ RUN npm install --omit=dev --no-package-lock
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/next.config.mjs ./next.config.mjs
 COPY --from=builder /app/bundled-skills ./bundled-skills
+COPY --from=builder /app/src/prompts ./src/prompts
 
 RUN mkdir -p /app/data/tmp /app/data/ms-playwright /app/data/npm-cache /app/data/.cache \
   && chown -R node:node /app "${PYTHON_VENV}"
