@@ -118,5 +118,20 @@
   }
   body {
     @apply bg-background text-foreground;
+    overflow: hidden;
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+}
+
+/* PWA safe area support for standalone mode */
+@supports (padding-top: env(safe-area-inset-top)) {
+  .pwa-safe-top {
+    padding-top: env(safe-area-inset-top);
+  }
+  .pwa-safe-bottom {
+    padding-bottom: env(safe-area-inset-bottom);
   }
 }
