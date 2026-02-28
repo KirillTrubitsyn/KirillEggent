@@ -372,6 +372,51 @@ function hasImages(attachments?: Attachment[]): boolean {
 }
 
 /**
+ * Detect whether a user message is a complex / coding task that should be
+ * routed to the utility (heavy) model instead of the lightweight chat model.
+ *
+ * Heuristics:
+ *  1. Contains fenced code blocks (```).
+ *  2. Contains programming-related action verbs (write, implement, fix, debug …).
+ *  3. Contains technical keywords (function, class, API, database …).
+ *  4. The message is long (> 300 chars), which usually signals a complex request.
+ */
+function isComplexTask(text: string): boolean {
+  // 1. Fenced code blocks
+  if (/```/.test(text)) return true;
+
+  const lower = text.toLowerCase();
+
+  // 2. Programming action verbs (with word boundaries for accuracy)
+  const actionPatterns = [
+    /\b(?:напиши|написать|реализуй|реализовать|исправь|исправить|отладь|отладить|рефакторь|рефакторинг|оптимизируй|оптимизировать|создай|создать|добавь|добавить|удали|удалить|измени|изменить|обнови|обновить|разработай|разработать|сгенерируй|сгенерировать|проанализируй|проанализировать)\b/,
+    /\b(?:write|implement|code|fix|debug|refactor|optimize|deploy|build|compile|develop|generate|create|add|remove|delete|update|modify|migrate|test|analyze|architect|design)\s/,
+    /\b(?:make a|build a|create a|write a|implement a|add a|fix the|debug the|refactor the)\b/,
+  ];
+  if (actionPatterns.some((p) => p.test(lower))) {
+    // Only trigger if there is also a technical hint — avoid false positives
+    // on innocent phrases like "write a poem" or "create a story".
+    const techHints =
+      /\b(?:код|кода|коде|функци|метод|класс|компонент|модуль|эндпоинт|баг|ошибк|сервер|скрипт|тест|бэкенд|фронтенд|api|sql|html|css|js|ts|json|yaml|docker|git|npm|pip|bash|shell|regex|http|rest|graphql|grpc|websocket|function|class|component|module|endpoint|bug|error|server|script|test|backend|frontend|database|query|schema|migration|pipeline|ci\/cd|kubernetes|terraform|aws|gcp|azure)\b/;
+    if (techHints.test(lower)) return true;
+  }
+
+  // 3. Heavy technical content even without action verbs
+  const codeIndicators = [
+    /\b(?:import|export|const|let|var|function|class|interface|type|enum|async|await|return|throw|try|catch)\b/,
+    /[{}\[\]();]=>/,             // common code punctuation
+    /\b(?:npm|yarn|pip|cargo|go get|apt|brew)\s+(?:install|add|run|build)\b/,
+    /\b(?:SELECT|INSERT|UPDATE|DELETE|CREATE TABLE|ALTER TABLE|DROP)\b/,
+  ];
+  if (codeIndicators.some((p) => p.test(text))) return true;
+
+  // 4. Long messages are usually complex requests
+  if (text.length > 300) return true;
+
+  return false;
+}
+
+/**
  * Build a multimodal user message content array from text + image attachments.
  * Falls back to a plain string when there are no image attachments.
  */
@@ -446,7 +491,9 @@ export async function runAgent(options: {
   const settings = await getSettings();
   const modelConfig = hasImages(options.attachments)
     ? settings.multimediaModel
-    : settings.chatModel;
+    : isComplexTask(options.userMessage)
+      ? settings.utilityModel
+      : settings.chatModel;
   const model = createModel(modelConfig);
 
   // Build context
@@ -608,7 +655,9 @@ export async function runAgentText(options: {
   const settings = await getSettings();
   const modelConfig = hasImages(options.attachments)
     ? settings.multimediaModel
-    : settings.chatModel;
+    : isComplexTask(options.userMessage)
+      ? settings.utilityModel
+      : settings.chatModel;
   const model = createModel(modelConfig);
 
   const context: AgentContext = {
