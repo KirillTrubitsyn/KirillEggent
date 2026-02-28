@@ -20,6 +20,85 @@ import fs from "fs/promises";
 
 const LLM_LOG_BORDER = "═".repeat(60);
 
+/**
+ * Maximum number of recent messages to keep in history when calling the LLM.
+ * This prevents the prompt from growing unboundedly as the conversation continues.
+ * Tool-call / tool-result pairs are counted individually.
+ */
+const MAX_HISTORY_MESSAGES = 40;
+
+/**
+ * Trim history to the most recent messages while keeping tool-call/tool-result
+ * pairs intact (never orphan a tool result without its preceding call).
+ */
+function trimHistory(messages: ModelMessage[]): ModelMessage[] {
+  if (messages.length <= MAX_HISTORY_MESSAGES) {
+    return messages;
+  }
+
+  // Take the tail of the history
+  let startIndex = messages.length - MAX_HISTORY_MESSAGES;
+
+  // Ensure we don't start on a tool-result message (orphaned from its call).
+  // Walk forward until we find a user or assistant message.
+  while (startIndex < messages.length && messages[startIndex].role === "tool") {
+    startIndex++;
+  }
+
+  const trimmed = messages.slice(startIndex);
+  if (trimmed.length < messages.length) {
+    console.log(
+      `[Agent] Trimmed history from ${messages.length} to ${trimmed.length} messages`
+    );
+  }
+  return trimmed;
+}
+
+/**
+ * After generateText completes, extract the final text.  When `generated.text`
+ * is empty (e.g. generation stopped on a tool-call step) we scan all response
+ * messages for the last non-empty assistant text so the user still gets an
+ * answer rather than "Пустой ответ от агента".
+ */
+function extractFinalText(
+  generated: { text: string; response?: { messages?: ModelMessage[] } }
+): string {
+  const primary = (generated.text ?? "").trim();
+  if (primary) return primary;
+
+  const responseMessages = generated.response?.messages;
+  if (!Array.isArray(responseMessages) || responseMessages.length === 0) {
+    return "";
+  }
+
+  // Walk response messages backwards looking for any assistant text
+  for (let i = responseMessages.length - 1; i >= 0; i--) {
+    const msg = responseMessages[i];
+    if (msg.role !== "assistant") continue;
+
+    const content = msg.content;
+    if (typeof content === "string" && content.trim()) {
+      return content.trim();
+    }
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (
+          typeof part === "object" &&
+          part !== null &&
+          "type" in part &&
+          part.type === "text" &&
+          "text" in part
+        ) {
+          const text = (part as { text: string }).text.trim();
+          if (text) return text;
+        }
+      }
+    }
+  }
+
+  return "";
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (value == null || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -420,7 +499,7 @@ export async function runAgent(options: {
   // Append user message to history (multimodal if image attachments present)
   const userContent = await buildUserContent(options.userMessage, options.attachments);
   const messages: ModelMessage[] = [
-    ...context.history,
+    ...trimHistory(context.history),
     { role: "user", content: userContent },
   ];
 
@@ -573,7 +652,7 @@ export async function runAgentText(options: {
 
   const userContent = await buildUserContent(options.userMessage, options.attachments);
   const messages: ModelMessage[] = [
-    ...context.history,
+    ...trimHistory(context.history),
     { role: "user", content: userContent },
   ];
 
@@ -598,7 +677,9 @@ export async function runAgentText(options: {
       maxOutputTokens: modelConfig.maxTokens ?? 4096,
     });
 
-    const text = generated.text ?? "";
+    const text = extractFinalText(
+      generated as unknown as { text: string; response?: { messages?: ModelMessage[] } }
+    );
 
     try {
       const latest = await getChat(options.chatId);
@@ -711,7 +792,7 @@ export async function runSubordinateAgent(options: {
   });
 
   // Include relevant parent history for context
-  const relevantHistory = options.parentHistory.slice(-6);
+  const relevantHistory = trimHistory(options.parentHistory).slice(-6);
 
   const messages: ModelMessage[] = [
     ...relevantHistory,
